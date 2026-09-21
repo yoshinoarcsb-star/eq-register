@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>生徒登録</title>
+<style>
+    :root {
+        --primary-color: #4a90e2;
+        --secondary-color: #f5a623;
+        --bg-color: #1a1a2e;
+        --panel-color: #16213e;
+        --text-color: #ffffff;
+        --danger-color: #e94560;
+        --success-color: #4caf50;
+    }
+    * { box-sizing: border-box; }
+    body {
+        font-family: 'Helvetica Neue', Arial, sans-serif;
+        background-color: var(--bg-color);
+        color: var(--text-color);
+        margin: 0;
+        padding: 20px;
+        display: flex;
+        justify-content: center;
+    }
+    #app {
+        width: 100%;
+        max-width: 420px;
+        background-color: var(--panel-color);
+        border-radius: 15px;
+        padding: 24px;
+        box-shadow: 0 10px 25px rgba(0,0,0,0.5);
+    }
+    h1 { text-align: center; color: var(--secondary-color); margin-top: 0; font-size: 20px; }
+    label {
+        display: block; font-size: 13px; color: #ccc; margin-bottom: 4px; margin-top: 14px;
+    }
+    input, select {
+        width: 100%; padding: 10px; border-radius: 8px; border: 1px solid #444;
+        background: #0f1730; color: #fff; font-size: 15px;
+    }
+    .btn {
+        display: block; width: 100%; padding: 14px; margin-top: 20px;
+        background-color: var(--primary-color); color: white; border: none;
+        border-radius: 8px; font-size: 16px; font-weight: bold; cursor: pointer;
+    }
+    .btn:active { transform: scale(0.98); }
+    .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+    .msg { text-align: center; font-size: 14px; margin-top: 14px; min-height: 18px; }
+    .msg.ok { color: var(--success-color); }
+    .msg.err { color: var(--danger-color); }
+</style>
+</head>
+<body>
+
+<div id="app">
+    <h1>生徒登録</h1>
+
+    <label>校舎</label>
+    <select id="f-school" onchange="suggestStudentNumber()"></select>
+
+    <label>生まれた年</label>
+    <select id="f-birth-year" onchange="suggestStudentNumber()"></select>
+
+    <label>生徒番号（自動生成・上書き可）</label>
+    <input type="text" id="f-number" inputmode="numeric" pattern="[0-9]*" oninput="this.value=this.value.replace(/[^0-9]/g,'')">
+
+    <label>氏名</label>
+    <input type="text" id="f-name" placeholder="例: 山田太郎">
+
+    <label>合言葉（自動生成。生徒に伝えてください）</label>
+    <div style="display:flex; gap:8px; align-items:center;">
+        <input type="text" id="f-pass" readonly style="flex:1; letter-spacing:2px; font-weight:bold; text-align:center;">
+        <button type="button" class="btn" style="width:auto; margin:0; padding:10px 14px;" onclick="regeneratePasscode()">🔄</button>
+    </div>
+
+    <label>学年</label>
+    <select id="f-grade"></select>
+
+    <button class="btn" id="submit-btn" onclick="submitStudent()">登録する</button>
+    <div class="msg" id="number-note" style="color:var(--primary-color);"></div>
+    <div class="msg" id="msg"></div>
+</div>
+
+<script>
+/* ---- Supabase連携設定 ----
+   このファイルはネットに公開しない（GitHub等にアップロードしない）でください。 */
+const SUPABASE_FUNCTION_URL = "https://sakkrwfnaromqzlfgatr.supabase.co/functions/v1/smart-service";
+const SUPABASE_PUBLISHABLE_KEY = "sb_publishable_MzlYHvTYTnO5plwIWU7Dnw_Wo8HuWK5";
+const ADMIN_SECRET = "tomato03"; // Edge FunctionのSecretsに登録した ADMIN_SECRET と完全一致させる
+
+/* ---- マスタ設定（校舎・学年の選択肢。admin.htmlと同じ内容にしてあります） ---- */
+const SCHOOLS = [
+    "住道加納校", "鴻池駅前校", "鶴見徳庵校", "都島中通校",
+    "寝屋川音羽校", "大東三箇校", "野崎駅前校", "阿倍野校"
+];
+const GRADE_OPTIONS = ["小学生", "中学1年", "中学2年", "中学3年", "その他"];
+
+// 生徒番号の自動採番用：校舎ごとのコード（SCHOOLSの並び順で 1, 2, ... 。ゼロ埋めしない。admin.htmlと同じ規則）
+const SCHOOL_CODES = {};
+SCHOOLS.forEach((name, i) => { SCHOOL_CODES[name] = String(i + 1); });
+
+let allStudentNumbers = []; // 採番の重複チェック用（生徒番号のみ保持）
+
+function fillSelect(id, values) {
+    document.getElementById(id).innerHTML = values.map(v => `<option value="${v}">${v}</option>`).join("");
+}
+
+function buildBirthYearOptions() {
+    const sel = document.getElementById("f-birth-year");
+    const thisYear = new Date().getFullYear();
+    const years = [];
+    for (let y = thisYear; y >= thisYear - 20; y--) years.push(y);
+    sel.innerHTML = '<option value="">生年を選択</option>' + years.map(y => `<option value="${y}">${y}年</option>`).join("");
+}
+
+/* 校舎・生年から次の生徒番号を提案する（admin.htmlの自動採番と同じ規則） */
+function suggestStudentNumber() {
+    const school = document.getElementById("f-school").value;
+    const birthYear = document.getElementById("f-birth-year").value;
+    const note = document.getElementById("number-note");
+    if (!school || !birthYear) { note.innerText = ""; return; }
+
+    const code = SCHOOL_CODES[school];
+    const yy = String(birthYear).slice(-2);
+    const prefix = code + yy;
+
+    let maxSeq = 0;
+    const re = new RegExp("^" + prefix + "(\\d+)$");
+    allStudentNumbers.forEach(n => {
+        const m = String(n).match(re);
+        if (m) maxSeq = Math.max(maxSeq, parseInt(m[1], 10));
+    });
+    const nextSeq = maxSeq + 1;
+    const suggested = prefix + String(nextSeq).padStart(2, "0");
+
+    document.getElementById("f-number").value = suggested;
+    note.innerText = `${school}（コード${code}） / ${birthYear}年生まれ / この組み合わせで${nextSeq}人目 → 生徒番号「${suggested}」`;
+}
+
+/* 合言葉をランダムな4桁数字で自動生成する（職員が入力・記憶する必要をなくすため） */
+function regeneratePasscode() {
+    const code = String(Math.floor(1000 + Math.random() * 9000)); // 1000〜9999
+    document.getElementById("f-pass").value = code;
+}
+
+/* 生徒一覧を取得（採番の重複チェック用。合言葉などは受け取らないよう項目を絞る想定） */
+function loadStudentNumbers() {
+    return callFunction({ action: "students" }).then(res => {
+        if (res && res.result === "success") {
+            allStudentNumbers = (res.students || []).map(s => s.number);
+        }
+    }).catch(() => { /* 取得できなくても、生徒番号は手入力で運用を続けられるようにする */ });
+}
+
+function callFunction(params) {
+    return fetch(SUPABASE_FUNCTION_URL, {
+        method: "POST",
+        headers: {
+            "Content-Type": "application/json",
+            "apikey": SUPABASE_PUBLISHABLE_KEY,
+            "Authorization": "Bearer " + SUPABASE_PUBLISHABLE_KEY
+        },
+        body: JSON.stringify(Object.assign({ adminSecret: ADMIN_SECRET }, params))
+    }).then(res => {
+        if (!res.ok) throw new Error("http_" + res.status);
+        return res.json();
+    });
+}
+
+function submitStudent() {
+    const number = document.getElementById("f-number").value.trim();
+    const name = document.getElementById("f-name").value.trim();
+    const passcode = document.getElementById("f-pass").value.trim();
+    const grade = document.getElementById("f-grade").value;
+    const school = document.getElementById("f-school").value;
+    const msg = document.getElementById("msg");
+    const btn = document.getElementById("submit-btn");
+
+    msg.className = "msg";
+    msg.innerText = "";
+    if (!school || !document.getElementById("f-birth-year").value) {
+        msg.className = "msg err";
+        msg.innerText = "校舎と生まれた年を選択してください（生徒番号が自動生成されます）";
+        return;
+    }
+    if (!number || !name) {
+        msg.className = "msg err";
+        msg.innerText = "生徒番号・氏名は必須です";
+        return;
+    }
+    if (!passcode) {
+        // 万が一クリアされていた場合は登録直前に再生成する
+        regeneratePasscode();
+    }
+
+    btn.disabled = true;
+    msg.innerText = "登録中…";
+
+    callFunction({ action: "addStudent", number, name, passcode: document.getElementById("f-pass").value, grade, school }).then(res => {
+        btn.disabled = false;
+        if (res && res.result === "success") {
+            msg.className = "msg ok";
+            msg.innerText = `登録しました　生徒番号: ${number}　合言葉: ${document.getElementById("f-pass").value}　※生徒に伝えてください`;
+            document.getElementById("f-name").value = "";
+            allStudentNumbers.push(number);
+            regeneratePasscode();
+            suggestStudentNumber(); // 校舎・生年は残したまま、次の生徒番号を再提案
+            document.getElementById("f-name").focus();
+        } else {
+            msg.className = "msg err";
+            if (res && res.message === "duplicate") {
+                msg.innerText = "この生徒番号は既に登録されています（番号を再提案しました）";
+                allStudentNumbers.push(number);
+                suggestStudentNumber();
+            } else {
+                msg.innerText = "登録に失敗しました";
+            }
+        }
+    }).catch(() => {
+        btn.disabled = false;
+        msg.className = "msg err";
+        msg.innerText = "通信エラーが発生しました";
+    });
+}
+
+window.onload = function () {
+    fillSelect("f-grade", GRADE_OPTIONS);
+    fillSelect("f-school", SCHOOLS);
+    buildBirthYearOptions();
+    regeneratePasscode();
+    loadStudentNumbers();
+};
+</script>
+
+</body>
+</html>
